@@ -2,7 +2,7 @@
 rem Usage: build_vs2019.bat [Configuration] [Architecture]
 rem Example: build_vs2019.bat Debug x64
 
-tasklist /FI "IMAGENAME eq MemoryMoniter.exe" /FO LIST
+taskkill /f /im MemoryMoniter.exe 2>nul || echo "!!! MemoryMoniter.exe is over !!!"
 
 setlocal enabledelayedexpansion
 set CONFIG=%1
