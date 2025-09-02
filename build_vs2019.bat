@@ -34,5 +34,21 @@ if errorlevel 1 (
 )
 
 echo Build completed successfully. Output folder: %BUILD_DIR%\%CONFIG%
+
+rem Locate built executable and run it immediately
+set EXE_NAME=MemoryMoniter.exe
+set EXE_PATH=%BUILD_DIR%\%CONFIG%\%EXE_NAME%
+if not exist "%EXE_PATH%" (
+    set EXE_PATH=%BUILD_DIR%\%ARCH%\%CONFIG%\%EXE_NAME%
+)
+
+if not exist "%EXE_PATH%" (
+    echo Warning: Executable not found: "%BUILD_DIR%\%CONFIG%\%EXE_NAME%" or "%BUILD_DIR%\%ARCH%\%CONFIG%\%EXE_NAME%"
+    endlocal
+    exit /b 4
+)
+
+echo Launching %EXE_PATH% ...
+start "" "%EXE_PATH%"
 endlocal
 exit /b 0

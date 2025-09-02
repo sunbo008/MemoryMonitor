@@ -6,9 +6,12 @@
 #include <cstdlib>
 #include <ctime>
 #include <cstring>  // for memset
+#include <tlhelp32.h>  // for process enumeration
+#include <fstream>     // for debug logging
 
 #include <windowsx.h>
 #include <iomanip>
+#include <algorithm>
 
 // 确保使用Unicode编码
 #ifndef UNICODE
@@ -32,13 +35,60 @@ std::vector<time_t> g_timeHistory;
 static size_t g_lastMaxVal = 1;
 static bool g_needRecalcMax = true;
 
-HWND hEdit, hButton, hList;
+HWND hEdit, hButton, hList, hComboProcess;
 int g_mouseX = -1, g_mouseY = -1;
 bool g_mouseInGraph = false;
 HFONT g_hFontSimSun = NULL;
 // 添加防抖动变量
 static DWORD g_lastMouseMove = 0;
 static const DWORD MOUSE_THROTTLE_MS = 50; // 50ms防抖动
+
+// 进程监控相关变量
+static DWORD g_targetProcessId = 0;  // 0表示监控当前进程
+static HANDLE g_targetProcessHandle = NULL;
+
+// 获取程序同目录下的日志文件路径
+std::wstring getLogFilePath() {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    
+    // 获取目录路径
+    std::wstring dir = exePath;
+    size_t lastSlash = dir.find_last_of(L"\\");
+    if (lastSlash != std::wstring::npos) {
+        dir = dir.substr(0, lastSlash + 1);
+    }
+    
+    return dir + L"debug.log";
+}
+
+// 调试日志函数 - 写入到程序同目录
+void writeDebugLog(const std::wstring& message) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::wstringstream ss;
+    ss << L"[" << st.wHour << L":" << st.wMinute << L":" << st.wSecond << L"." << st.wMilliseconds << L"] " << message;
+    
+    // 输出到调试器
+    OutputDebugStringW(ss.str().c_str());
+    
+    // 写入到程序同目录下的debug.log
+    std::wstring logPath = getLogFilePath();
+    HANDLE hFile = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        SetFilePointer(hFile, 0, NULL, FILE_END);
+        std::string utf8Message;
+        int len = WideCharToMultiByte(CP_UTF8, 0, ss.str().c_str(), -1, NULL, 0, NULL, NULL);
+        if (len > 0) {
+            utf8Message.resize(len - 1);
+            WideCharToMultiByte(CP_UTF8, 0, ss.str().c_str(), -1, &utf8Message[0], len, NULL, NULL);
+            utf8Message += "\r\n";
+            DWORD written;
+            WriteFile(hFile, utf8Message.c_str(), (DWORD)utf8Message.length(), &written, NULL);
+        }
+        CloseHandle(hFile);
+    }
+}
 
 static std::wstring formatBytes(size_t bytes) {
     double v = (double)bytes;
@@ -54,14 +104,16 @@ static std::wstring formatBytes(size_t bytes) {
 }
 size_t getCurrentRSS() {
     PROCESS_MEMORY_COUNTERS counters;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+    HANDLE hProcess = (g_targetProcessHandle != NULL) ? g_targetProcessHandle : GetCurrentProcess();
+    if (GetProcessMemoryInfo(hProcess, &counters, sizeof(counters))) {
         return counters.WorkingSetSize;
     }
     return 0;
 }
 size_t getPeakRSS() {
     PROCESS_MEMORY_COUNTERS counters;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+    HANDLE hProcess = (g_targetProcessHandle != NULL) ? g_targetProcessHandle : GetCurrentProcess();
+    if (GetProcessMemoryInfo(hProcess, &counters, sizeof(counters))) {
         return counters.PeakWorkingSetSize;
     }
     return 0;
@@ -70,7 +122,119 @@ size_t getPeakRSS() {
 void addListItem(HWND list, size_t size, int index) {
     std::wstringstream ss;
     ss << L"内存块 " << index << L" | " << size / 1024 << L" KB";
-    SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)ss.str().c_str());
+    // 插入后滚动到新项
+    int listIndex = (int)SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)ss.str().c_str());
+    if (listIndex >= 0) {
+        SendMessageW(list, LB_SETTOPINDEX, (WPARAM)listIndex, 0);
+    }
+}
+
+// 根据项目数量动态调整 ComboBox 下拉高度，超过20项则限制可见20项并出现滚动条
+void adjustComboDropHeight(HWND hCombo) {
+    if (!hCombo || !IsWindow(hCombo)) return;
+    int totalItems = (int)SendMessageW(hCombo, CB_GETCOUNT, 0, 0);
+    int visible = totalItems <= 0 ? 4 : totalItems; // 至少显示4行
+    if (visible > 20) visible = 20;
+
+    int itemHeight = (int)SendMessageW(hCombo, CB_GETITEMHEIGHT, 0, 0);
+    int selHeight = (int)SendMessageW(hCombo, CB_GETITEMHEIGHT, (WPARAM)-1, 0);
+    if (itemHeight <= 0) itemHeight = 16;
+    if (selHeight <= 0) selHeight = 24;
+
+    int borderPad = GetSystemMetrics(SM_CYEDGE) * 6; // 边框/阴影余量
+    int newHeight = selHeight + itemHeight * visible + borderPad;
+
+    RECT r; GetWindowRect(hCombo, &r);
+    POINT pt = { r.left, r.top };
+    HWND hParent = GetParent(hCombo);
+    if (!hParent) return;
+    ScreenToClient(hParent, &pt);
+    int width = r.right - r.left;
+
+    SetWindowPos(hCombo, NULL, pt.x, pt.y, width, newHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// 填充进程列表
+void populateProcessList(HWND hCombo) {
+    writeDebugLog(L"Starting to populate process list...");
+    
+    if (!hCombo || !IsWindow(hCombo)) {
+        writeDebugLog(L"ERROR: Invalid ComboBox handle!");
+        return;
+    }
+    
+    int resetResult = (int)SendMessageW(hCombo, CB_RESETCONTENT, 0, 0);
+    writeDebugLog(L"CB_RESETCONTENT result: " + std::to_wstring(resetResult));
+    
+    // 添加当前进程选项
+    std::wstringstream currentProcess;
+    currentProcess << L"[当前进程] " << GetCurrentProcessId();
+    int addResult = (int)SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)currentProcess.str().c_str());
+    writeDebugLog(L"Added current process, index: " + std::to_wstring(addResult));
+    SendMessageW(hCombo, CB_SETITEMDATA, 0, (LPARAM)GetCurrentProcessId());
+    
+    // 枚举系统进程（不再限制数量，自动通过下拉高度与滚动条处理）
+    struct ProcItem { std::wstring name; DWORD pid; };
+    std::vector<ProcItem> procItems;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        writeDebugLog(L"Process snapshot created successfully");
+        PROCESSENTRY32W pe32;
+        pe32.dwSize = sizeof(pe32);
+        
+        if (Process32FirstW(hSnapshot, &pe32)) {
+            do {
+                // 跳过系统进程和当前进程
+                if (pe32.th32ProcessID != 0 && pe32.th32ProcessID != 4 && 
+                    pe32.th32ProcessID != GetCurrentProcessId()) {
+                    
+                    // 尝试打开进程以检查是否有权限访问
+                    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe32.th32ProcessID);
+                    if (hProc) {
+                        procItems.push_back(ProcItem{ std::wstring(pe32.szExeFile), pe32.th32ProcessID });
+                        CloseHandle(hProc);
+                    }
+                }
+            } while (Process32NextW(hSnapshot, &pe32));
+        } else {
+            writeDebugLog(L"Process32FirstW failed");
+        }
+        CloseHandle(hSnapshot);
+    } else {
+        writeDebugLog(L"CreateToolhelp32Snapshot failed");
+    }
+
+    // 名称升序排序（不区分大小写）
+    std::sort(procItems.begin(), procItems.end(), [](const ProcItem& a, const ProcItem& b){
+        int r = CompareStringOrdinal(a.name.c_str(), -1, b.name.c_str(), -1, TRUE);
+        return r == CSTR_LESS_THAN; // 若相等则保持稳定顺序
+    });
+
+    // 添加已排序的进程到下拉框
+    int logCount = 0;
+    for (const auto& it : procItems) {
+        std::wstringstream ss;
+        ss << it.name << L" (PID: " << it.pid << L")";
+        int index = (int)SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)ss.str().c_str());
+        SendMessageW(hCombo, CB_SETITEMDATA, index, (LPARAM)it.pid);
+        if (logCount < 5) {
+            writeDebugLog(L"Added process: " + it.name + L" at index " + std::to_wstring(index));
+            ++logCount;
+        }
+    }
+
+    writeDebugLog(L"Total processes added: " + std::to_wstring((int)procItems.size() + 1)); // +1 for current进程
+    
+    // 获取ComboBox项目总数
+    int totalItems = (int)SendMessageW(hCombo, CB_GETCOUNT, 0, 0);
+    writeDebugLog(L"ComboBox total items: " + std::to_wstring(totalItems));
+    
+    // 默认选择当前进程
+    int selResult = (int)SendMessageW(hCombo, CB_SETCURSEL, 0, 0);
+    writeDebugLog(L"CB_SETCURSEL result: " + std::to_wstring(selResult));
+
+    // 根据数量动态调整下拉高度
+    adjustComboDropHeight(hCombo);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -81,11 +245,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int width = rc.right - rc.left;
         int height = rc.bottom - rc.top;
 
+        // 进程选择ComboBox - 使用CBS_DROPDOWN样式，允许超过可见项时显示滚动条
+        writeDebugLog(L"Creating ComboBox...");
+        hComboProcess = CreateWindowW(L"COMBOBOX", NULL, 
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | CBS_HASSTRINGS | CBS_AUTOHSCROLL | WS_VSCROLL,
+            10, height / 2 + 10, 250, 150, hwnd, (HMENU)4, NULL, NULL);
+        
+        if (hComboProcess) {
+            writeDebugLog(L"ComboBox created successfully, handle: " + std::to_wstring((uintptr_t)hComboProcess));
+        } else {
+            writeDebugLog(L"ComboBox creation FAILED!");
+        }
+
         hEdit = CreateWindowW(L"EDIT", L"0", WS_CHILD | WS_VISIBLE | WS_BORDER,
-            10, height / 2 + 10, 100, 25, hwnd, (HMENU)1, NULL, NULL);
+            270, height / 2 + 10, 100, 25, hwnd, (HMENU)1, NULL, NULL);
 
         hButton = CreateWindowW(L"BUTTON", L"申请内存", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            120, height / 2 + 10, 120, 30, hwnd, (HMENU)2, NULL, NULL);
+            380, height / 2 + 10, 120, 30, hwnd, (HMENU)2, NULL, NULL);
 
         hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
             10, height / 2 + 50, width - 20, height / 2 - 60, hwnd, (HMENU)3, NULL, NULL);
@@ -99,6 +275,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // 创建宋体并应用到控件
         g_hFontSimSun = CreateFontW(14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,FF_DONTCARE,L"宋体");
         if (g_hFontSimSun) {
+            SendMessage(hComboProcess, WM_SETFONT, (WPARAM)g_hFontSimSun, TRUE);
             SendMessage(hEdit, WM_SETFONT, (WPARAM)g_hFontSimSun, TRUE);
             SendMessage(hButton, WM_SETFONT, (WPARAM)g_hFontSimSun, TRUE);
             SendMessage(hList, WM_SETFONT, (WPARAM)g_hFontSimSun, TRUE);
@@ -114,13 +291,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         g_needRecalcMax = true;
         
+        // 填充进程列表
+        writeDebugLog(L"About to populate process list...");
+        populateProcessList(hComboProcess);
+        // 初次根据数量调整下拉高度
+        adjustComboDropHeight(hComboProcess);
+        writeDebugLog(L"Process list population completed");
+        
         // 立即刷新一次显示
         InvalidateRect(hwnd, NULL, FALSE);
         break;
     }
     case WM_SIZE: {
         // 窗口大小改变时重新布局控件
-        if (wParam != SIZE_MINIMIZED && hEdit && hButton && hList) {
+        if (wParam != SIZE_MINIMIZED && hComboProcess && hEdit && hButton && hList) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             int width = rc.right - rc.left;
@@ -129,12 +313,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // 重新定位控件，保持相对位置
             int midY = height / 2;
             
+            // 仅定位，不改变大小；大小（含下拉高度）由 adjustComboDropHeight 控制
+            SetWindowPos(hComboProcess, NULL, 10, midY + 10, 0, 0,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+
+            // 根据项目数量动态调整下拉高度
+            adjustComboDropHeight(hComboProcess);
+            
             // 输入框位置
-            SetWindowPos(hEdit, NULL, 10, midY + 10, 100, 25, 
+            SetWindowPos(hEdit, NULL, 270, midY + 10, 100, 25, 
                 SWP_NOZORDER | SWP_NOACTIVATE);
             
             // 按钮位置
-            SetWindowPos(hButton, NULL, 120, midY + 10, 120, 30, 
+            SetWindowPos(hButton, NULL, 380, midY + 10, 120, 30, 
                 SWP_NOZORDER | SWP_NOACTIVATE);
             
             // 列表框位置和大小，随窗口大小动态调整
@@ -172,8 +363,61 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(hwnd, &graphRect, FALSE);
         break;
     }
+
+    case WM_LBUTTONDOWN: {
+        // 记录鼠标点击位置
+        int x = LOWORD(lParam);
+        int y = HIWORD(lParam);
+        writeDebugLog(L"Mouse click at (" + std::to_wstring(x) + L", " + std::to_wstring(y) + L")");
+        
+        // 检查是否点击在ComboBox上
+        if (hComboProcess) {
+            RECT comboRect;
+            GetWindowRect(hComboProcess, &comboRect);
+            POINT pt = {x, y};
+            ClientToScreen(hwnd, &pt);
+            if (PtInRect(&comboRect, pt)) {
+                writeDebugLog(L"Click detected on ComboBox!");
+            }
+        }
+        break;
+    }
     case WM_COMMAND: {
-                 if (LOWORD(wParam) == 2) { // 申请按钮
+        // 添加更详细的命令消息日志
+        WORD ctrlId = LOWORD(wParam);
+        WORD notifyCode = HIWORD(wParam);
+        writeDebugLog(L"WM_COMMAND: ctrlId=" + std::to_wstring(ctrlId) + L", notifyCode=" + std::to_wstring(notifyCode));
+        
+        if (ctrlId == 4) { // ComboBox ID
+            writeDebugLog(L"ComboBox command received!");
+            switch (notifyCode) {
+            case CBN_DROPDOWN:
+                writeDebugLog(L"CBN_DROPDOWN - ComboBox about to drop down");
+                break;
+            case CBN_CLOSEUP:
+                writeDebugLog(L"CBN_CLOSEUP - ComboBox closed up");
+                break;
+            case CBN_SELCHANGE:
+                writeDebugLog(L"CBN_SELCHANGE - Selection changed");
+                break;
+            case CBN_SETFOCUS:
+                writeDebugLog(L"CBN_SETFOCUS - ComboBox got focus");
+                break;
+            case CBN_KILLFOCUS:
+                writeDebugLog(L"CBN_KILLFOCUS - ComboBox lost focus");
+                break;
+            case CBN_ERRSPACE:
+                writeDebugLog(L"CBN_ERRSPACE - ComboBox out of memory! Switching to CBS_DROPDOWN style should fix this.");
+                // 强制重新创建ComboBox（如果需要的话）
+                break;
+            default:
+                writeDebugLog(L"Other ComboBox notification: " + std::to_wstring(notifyCode));
+                break;
+            }
+        }
+        
+        // 原有的命令处理逻辑
+        if (LOWORD(wParam) == 2) { // 申请按钮
              wchar_t buf[64];
              GetWindowTextW(hEdit, buf, 64);
             int size = _wtoi(buf);
@@ -208,6 +452,49 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(hList, &itemRect, FALSE);
                 }
                 // 已释放的项不响应双击事件
+            }
+        }
+        else if (LOWORD(wParam) == 4 && HIWORD(wParam) == CBN_SELCHANGE) { // 进程选择变化
+            int sel = (int)SendMessageW(hComboProcess, CB_GETCURSEL, 0, 0);
+            if (sel != CB_ERR) {
+                DWORD processId = (DWORD)SendMessageW(hComboProcess, CB_GETITEMDATA, sel, 0);
+                
+                // 关闭之前的进程句柄
+                if (g_targetProcessHandle && g_targetProcessHandle != GetCurrentProcess()) {
+                    CloseHandle(g_targetProcessHandle);
+                    g_targetProcessHandle = NULL;
+                }
+                
+                g_targetProcessId = processId;
+                
+                // 如果不是当前进程，打开目标进程
+                if (processId != GetCurrentProcessId()) {
+                    g_targetProcessHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+                    if (!g_targetProcessHandle) {
+                        // 如果无法打开进程，回退到当前进程
+                        MessageBoxW(hwnd, L"无法访问选定的进程，可能需要管理员权限", L"警告", MB_OK | MB_ICONWARNING);
+                        SendMessageW(hComboProcess, CB_SETCURSEL, 0, 0); // 选回当前进程
+                        g_targetProcessId = GetCurrentProcessId();
+                    }
+                } else {
+                    g_targetProcessHandle = NULL; // 当前进程不需要句柄
+                }
+                
+                // 清空历史数据，重新开始监控
+                g_memHistory.clear();
+                g_peakHistory.clear();
+                g_timeHistory.clear();
+                g_needRecalcMax = true;
+                
+                // 立即收集新进程的数据
+                for (int i = 0; i < 3; ++i) {
+                    g_memHistory.push_back(getCurrentRSS());
+                    g_peakHistory.push_back(getPeakRSS());
+                    g_timeHistory.push_back(time(NULL));
+                }
+                
+                // 刷新显示
+                InvalidateRect(hwnd, NULL, FALSE);
             }
         }
         break;
@@ -600,7 +887,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         for (auto& a : g_allocations)
             if (!a.freed) delete[] (char*)a.ptr;
-    if (g_hFontSimSun) { DeleteObject(g_hFontSimSun); g_hFontSimSun = NULL; }
+        // 清理进程句柄
+        if (g_targetProcessHandle && g_targetProcessHandle != GetCurrentProcess()) {
+            CloseHandle(g_targetProcessHandle);
+            g_targetProcessHandle = NULL;
+        }
+        if (g_hFontSimSun) { DeleteObject(g_hFontSimSun); g_hFontSimSun = NULL; }
         PostQuitMessage(0);
         break;
     }
@@ -608,6 +900,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+    // 清空调试日志文件（写入到程序同目录）
+    std::wstring logPath = getLogFilePath();
+    HANDLE hFile = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        const char* header = "=== Memory Monitor Debug Log Started ===\r\n";
+        DWORD written;
+        WriteFile(hFile, header, (DWORD)strlen(header), &written, NULL);
+        CloseHandle(hFile);
+    }
+    writeDebugLog(L"Program started");
+    
     srand((unsigned)time(NULL));
 
     WNDCLASSW wc = { 0 };
@@ -618,7 +921,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     RegisterClassW(&wc);
 
     HWND hwnd = CreateWindowW(L"MyWinClass", L"内存峰值监视器",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         NULL, NULL, hInst, NULL);
     ShowWindow(hwnd, nCmdShow);
 
