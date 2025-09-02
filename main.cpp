@@ -90,7 +90,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
             10, height / 2 + 50, width - 20, height / 2 - 60, hwnd, (HMENU)3, NULL, NULL);
 
-        SetTimer(hwnd, 1, 2000, NULL);
+        // 减少定时器间隔，提高数据刷新频率
+        SetTimer(hwnd, 1, 1000, NULL);
         // 预分配容器大小，减少内存重新分配
         g_memHistory.reserve(250);
         g_peakHistory.reserve(250);
@@ -104,6 +105,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
                  // 设置列表框行高，确保文字完整显示
          SendMessageW(hList, LB_SETITEMHEIGHT, 0, 20);
+        
+        // 立即收集初始数据，避免启动时空白
+        for (int i = 0; i < 3; ++i) {
+            g_memHistory.push_back(getCurrentRSS());
+            g_peakHistory.push_back(getPeakRSS());
+            g_timeHistory.push_back(time(NULL));
+        }
+        g_needRecalcMax = true;
+        
+        // 立即刷新一次显示
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+    }
+    case WM_SIZE: {
+        // 窗口大小改变时重新布局控件
+        if (wParam != SIZE_MINIMIZED && hEdit && hButton && hList) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            int width = rc.right - rc.left;
+            int height = rc.bottom - rc.top;
+            
+            // 重新定位控件，保持相对位置
+            int midY = height / 2;
+            
+            // 输入框位置
+            SetWindowPos(hEdit, NULL, 10, midY + 10, 100, 25, 
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            
+            // 按钮位置
+            SetWindowPos(hButton, NULL, 120, midY + 10, 120, 30, 
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            
+            // 列表框位置和大小，随窗口大小动态调整
+            int listHeight = height / 2 - 60;
+            if (listHeight < 100) listHeight = 100; // 最小高度
+            SetWindowPos(hList, NULL, 10, midY + 50, width - 20, listHeight, 
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            
+            // 重绘整个窗口
+            InvalidateRect(hwnd, NULL, TRUE);
+        }
         break;
     }
     case WM_TIMER: {
@@ -234,14 +276,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         FillRect(drawDC, &rc, bgBrush);
         DeleteObject(bgBrush);
 
-        // 绘制网格
+        // 绘制网格 - 动态调整图表区域
         HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(50,50,50));
         HPEN lightGrid = CreatePen(PS_SOLID, 1, RGB(40,40,40));
         SelectObject(drawDC, gridPen);
-        int graphTop = 0;
-        int graphBottom = mid - 10;
-        int graphLeft = 0;
-        int graphRight = rc.right;
+        int graphTop = 10;  // 上边距
+        int graphBottom = mid - 15;  // 下边距
+        int graphLeft = 50;  // 左边距，为Y轴标签留空间
+        int graphRight = rc.right - 10;  // 右边距
+        
+        // 确保图表区域有效
+        if (graphBottom <= graphTop) graphBottom = graphTop + 100;
+        if (graphRight <= graphLeft) graphRight = graphLeft + 200;
         // horizontal grid
         int hLines = 8;
         for (int i = 0; i <= hLines; ++i) {
@@ -277,26 +323,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // 使用已经选中的宋体字体
             for (int t = 0; t <= 4; t++) {
                 double frac = t / 4.0;
-                int y = mid - (int)(frac * (mid - 20));
-                MoveToEx(drawDC, 6, y, NULL);
-                LineTo(drawDC, 12, y);
+                int y = graphBottom - (int)(frac * (graphBottom - graphTop));
+                MoveToEx(drawDC, graphLeft - 6, y, NULL);
+                LineTo(drawDC, graphLeft, y);
                 // Label
                 size_t val = (size_t)(maxVal * frac);
                 std::wstringstream ss;
                 ss << formatBytes(val);
                 // 以浅色字体显示
-                                 SetTextColor(drawDC, RGB(180,180,180));
-                 SetBkMode(drawDC, TRANSPARENT);
-                 TextOutW(drawDC, 14, y - 8, ss.str().c_str(), (int)ss.str().size());
+                SetTextColor(drawDC, RGB(180,180,180));
+                SetBkMode(drawDC, TRANSPARENT);
+                TextOutW(drawDC, 5, y - 8, ss.str().c_str(), (int)ss.str().size());
             }
 
             // 蓝线：当前内存
             // 先构造点数组并填充下面的区域
             std::vector<POINT> pts;
             pts.reserve(count + 2);
+            int graphWidth = graphRight - graphLeft;
             for (int i = 0; i < count; ++i) {
-                int x = i * 3;
-                int y = mid - (int)((double)g_memHistory[i] / maxVal * (mid - 20));
+                // 动态计算X坐标，根据图表宽度和数据点数量
+                int x = graphLeft + (count > 1 ? (i * graphWidth) / (count - 1) : graphWidth / 2);
+                int y = graphBottom - (int)((double)g_memHistory[i] / maxVal * (graphBottom - graphTop));
                 pts.push_back({x, y});
             }
             // 填充多边形（曲线 + 底边回到起点）
@@ -322,9 +370,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // 红线：峰值
             SelectObject(drawDC, hRed);
-            MoveToEx(drawDC, 0, mid - (int)((double)g_peakHistory[0] / maxVal * (mid - 20)), NULL);
-            for (int i = 1; i < count; i++) {
-                LineTo(drawDC, i * 3, mid - (int)((double)g_peakHistory[i] / maxVal * (mid - 20)));
+            if (count > 0) {
+                int x0 = graphLeft;
+                int y0 = graphBottom - (int)((double)g_peakHistory[0] / maxVal * (graphBottom - graphTop));
+                MoveToEx(drawDC, x0, y0, NULL);
+                for (int i = 1; i < count; i++) {
+                    int x = graphLeft + (count > 1 ? (i * graphWidth) / (count - 1) : graphWidth / 2);
+                    int y = graphBottom - (int)((double)g_peakHistory[i] / maxVal * (graphBottom - graphTop));
+                    LineTo(drawDC, x, y);
+                }
             }
 
             // 绘制图例 - 调整位置和大小确保文字完整显示
@@ -344,8 +398,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DeleteObject(lgBlue); DeleteObject(lgRed);
 
             // 如果鼠标在图中，显示坐标信息
-            if (g_mouseInGraph && g_mouseX >= 0) {
-                int idx = g_mouseX / 3;
+            if (g_mouseInGraph && g_mouseX >= 0 && count > 0) {
+                // 根据鼠标X坐标计算对应的数据点索引
+                int relativeX = g_mouseX - graphLeft;
+                if (relativeX < 0) relativeX = 0;
+                if (relativeX > graphWidth) relativeX = graphWidth;
+                int idx = count > 1 ? (relativeX * (count - 1)) / graphWidth : 0;
                 if (idx < 0) idx = 0;
                 if (idx >= count) idx = count - 1;
                 double curVal = (double)g_memHistory[idx];
